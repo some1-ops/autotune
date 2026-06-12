@@ -1,0 +1,95 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;900&family=JetBrains+Mono:wght@400;500&display=swap');
+@import "tailwindcss";
+
+:root {
+  --bg-primary: #06060f;
+  --bg-secondary: #0a0a18;
+  --bg-card: #0d0d1f;
+  --border: #1a1a3a;
+  --border-subtle: #12122a;
+  --accent-purple: #a855f7;
+  --accent-pink: #ec4899;
+  --accent-cyan: #06b6d4;
+  --accent-green: #22c55e;
+  --text-primary: #f8fafc;
+  --text-muted: #64748b;
+  --text-faint: #2a2a4a;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: 'Inter', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom scrollbars */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: #2a2a4a;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover { background: #3a3a6a; }
+
+/* Audio element dark theme */
+audio {
+  filter: invert(1) hue-rotate(180deg);
+  border-radius: 4px;
+}
+
+/* Prevent selection during knob drag */
+.select-none { user-select: none; }
+
+/* Glow utilities */
+.glow-purple { box-shadow: 0 0 20px #a855f720; }
+.glow-pink   { box-shadow: 0 0 20px #ec489920; }
+
+/* Studio grid layout */
+.studio-grid {
+  display: grid;
+  grid-template-columns: 280px 1fr 260px;
+  grid-template-rows: 1fr;
+  height: calc(100vh - 65px);
+}
+
+/* Pulse animation for recording */
+@keyframes rec-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.rec-pulse { animation: rec-pulse 1s ease-in-out infinite; }
+
+/* Gradient text */
+.gradient-text {
+  background: linear-gradient(135deg, #a855f7 0%, #ec4899 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* Frosted glass card */
+.glass-card {
+  background: rgba(10, 10, 24, 0.8);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+/* Active knob glow */
+.knob-active {
+  filter: drop-shadow(0 0 8px #a855f780);
+}
