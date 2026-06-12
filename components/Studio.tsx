@@ -1,514 +1,670 @@
 "use client";
-// components/Studio.tsx — Master studio layout, wires everything together
+// components/Studio.tsx — VocalBooth Auto-Tune Pro UI (matches reference design)
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AudioEngine, type PitchInfo } from "@/lib/audio/AudioEngine";
-import { PRESETS, KEY_NAMES, SCALE_NAMES, type VocalPreset } from "@/lib/audio/presets";
-import { Knob } from "@/components/Knob";
-import { PitchMeter } from "@/components/PitchMeter";
-import { Waveform } from "@/components/Waveform";
-import { PresetSelector } from "@/components/PresetSelector";
 
-type AppState = "idle" | "ready" | "recording" | "error";
+// ── Constants ──────────────────────────────────────────────────────────────
+const NOTES = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
 
+const SCALE_INTERVALS: Record<string, number[]> = {
+  major:      [0,2,4,5,7,9,11],
+  minor:      [0,2,3,5,7,8,10],
+  chromatic:  [0,1,2,3,4,5,6,7,8,9,10,11],
+  pentatonic: [0,2,4,7,9],
+  blues:      [0,3,5,6,7,10],
+  dorian:     [0,2,3,5,7,9,10],
+  mixolydian: [0,2,4,5,7,9,10],
+};
+
+const SCALE_KEYS = ["major","minor","chromatic","pentatonic","blues","dorian","mixolydian"];
+const SCALE_LABELS = ["Major","Minor","Chromatic","Pentatonic","Blues","Dorian","Mixolydian"];
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+const hzToMidi = (hz: number) => 69 + 12 * Math.log2(hz / 440);
+const midiToHz = (m: number) => 440 * 2 ** ((m - 69) / 12);
+const fmtTime = (s: number) =>
+  `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+
+function snapToScale(hz: number, keyIdx: number, scaleId: string): number {
+  if (hz <= 0) return 0;
+  const ivs = SCALE_INTERVALS[scaleId] ?? SCALE_INTERVALS.chromatic;
+  const midi = hzToMidi(hz);
+  let best = Math.round(midi), dist = Infinity;
+  for (let o = -12; o <= 12; o++) {
+    const c = Math.round(midi) + o;
+    if (ivs.includes(((c - keyIdx) % 12 + 12) % 12)) {
+      const d = Math.abs(c - midi);
+      if (d < dist) { dist = d; best = c; }
+    }
+  }
+  return midiToHz(best);
+}
+
+// ── Inline style helpers ───────────────────────────────────────────────────
+const card: React.CSSProperties = {
+  width: "100%", maxWidth: "480px",
+  background: "#101018", border: "1px solid #22223a", borderRadius: "14px",
+  padding: "16px",
+};
+const cardTitle: React.CSSProperties = {
+  fontSize: "0.6rem", fontFamily: "'Space Mono', monospace",
+  color: "#5a5a7a", letterSpacing: "0.12em", textTransform: "uppercase",
+  marginBottom: "14px",
+};
+const mono: React.CSSProperties = { fontFamily: "'Space Mono', monospace" };
+
+// ── Component ──────────────────────────────────────────────────────────────
 export function Studio() {
+  // ── Engine ────────────────────────────────────────────────────────────────
   const engineRef = useRef<AudioEngine | null>(null);
-  const [appState, setAppState] = useState<AppState>("idle");
-  const [micActive, setMicActive] = useState(false);
-  const [pitchInfo, setPitchInfo] = useState<PitchInfo | null>(null);
-  const [currentPreset, setCurrentPreset] = useState<VocalPreset>(PRESETS[0]);
-  const [bypass, setBypass] = useState(false);
-  const [beatLoaded, setBeatLoaded] = useState(false);
-  const [beatPlaying, setBeatPlaying] = useState(false);
-  const [beatFilename, setBeatFilename] = useState<string>("");
+  const [isOn, setIsOn]   = useState(false);
+  const [isRec, setIsRec] = useState(false);
+  const [pitchInfo, setPitchInfo]   = useState<PitchInfo | null>(null);
+  const [analyser, setAnalyser]     = useState<AnalyserNode | null>(null);
   const [recordings, setRecordings] = useState<{ blob: Blob; url: string; ts: number }[]>([]);
-  const [analyser, setAnalyser] = useState<AnalyserNode | null>(null);
-  const [beatAnalyser, setBeatAnalyser] = useState<AnalyserNode | null>(null);
-  const [errorMsg, setErrorMsg] = useState<string>("");
-  const beatInputRef = useRef<HTMLInputElement>(null);
 
-  // Knob state (display only — AudioEngine holds truth)
-  const [retuneSpeed, setRetuneSpeed] = useState(currentPreset.retuneSpeed);
-  const [humanize, setHumanize] = useState(currentPreset.humanize);
-  const [reverbWet, setReverbWet] = useState(currentPreset.reverbWet);
-  const [compThreshold, setCompThreshold] = useState(currentPreset.compThreshold);
-  const [selectedKey, setSelectedKey] = useState(currentPreset.key);
-  const [selectedScale, setSelectedScale] = useState(currentPreset.scale);
-  const [masterVol, setMasterVol] = useState(1.0);
-  const [beatVol, setBeatVol] = useState(0.8);
+  // ── Status ────────────────────────────────────────────────────────────────
+  const [statusMsg, setStatusMsg] = useState("Load a beat, then tap START");
+  const [statusDot, setStatusDot] = useState<"off"|"on"|"rec"|"warn">("off");
+  const [showHttps, setShowHttps] = useState(false);
 
-  // ── Engine init ──────────────────────────────────────────────────────────
-  const initEngine = useCallback(async () => {
+  // ── Beat (HTMLAudioElement — plays independently through headphones/speaker) ─
+  const beatRef     = useRef<HTMLAudioElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [beatLoaded, setBeatLoaded]           = useState(false);
+  const [beatPlaying, setBeatPlaying]         = useState(false);
+  const [beatLoop, setBeatLoop]               = useState(false);
+  const [beatFilename, setBeatFilename]       = useState("");
+  const [beatDuration, setBeatDuration]       = useState(0);
+  const [beatCurrentTime, setBeatCurrentTime] = useState(0);
+  const [beatVol, setBeatVol]                 = useState(80);
+  const [dragOver, setDragOver]               = useState(false);
+
+  // ── Controls ──────────────────────────────────────────────────────────────
+  const [keyIdx, setKeyIdx]     = useState(0);
+  const [scaleId, setScaleId]   = useState("minor");
+  const [speed, setSpeed]       = useState(55);
+  const [humanize, setHumanize] = useState(15);
+  const [xpose, setXpose]       = useState(0);
+  const [thresh, setThresh]     = useState(8);
+  const [micGain, setMicGain]   = useState(100);
+  const [tuneOn, setTuneOn]     = useState(true);
+  const [vibratoOn, setVibratoOn] = useState(false);
+  const [bypassOn, setBypassOn]   = useState(false);
+
+  // ── Canvas / DOM refs (direct updates avoid React render at 60fps) ────────
+  const wvCanvasRef  = useRef<HTMLCanvasElement>(null);
+  const pgCanvasRef  = useRef<HTMLCanvasElement>(null);
+  const wvAnimRef    = useRef<number>(0);
+  const pgAnimRef    = useRef<number>(0);
+  const trailRef     = useRef<number[]>([]);
+  const vuMicRef     = useRef<HTMLDivElement>(null);
+  const vuRecRef     = useRef<HTMLDivElement>(null);
+
+  // Mutable refs for use inside animation loops (no stale closure)
+  const analyserRef  = useRef<AnalyserNode | null>(null);
+  const isRecRef     = useRef(false);
+  const keyIdxRef    = useRef(0);
+  const scaleIdRef   = useRef("minor");
+  const pitchInfoRef = useRef<PitchInfo | null>(null);
+
+  // Pitch display DOM refs
+  const inNoteRef  = useRef<HTMLDivElement>(null);
+  const inHzRef    = useRef<HTMLDivElement>(null);
+  const outNoteRef = useRef<HTMLDivElement>(null);
+  const outHzRef   = useRef<HTMLDivElement>(null);
+  const centsNumRef = useRef<HTMLDivElement>(null);
+  const mbarRef    = useRef<HTMLDivElement>(null);
+
+  // ── Sync refs ──────────────────────────────────────────────────────────────
+  useEffect(() => { analyserRef.current = analyser; }, [analyser]);
+  useEffect(() => { isRecRef.current    = isRec;     }, [isRec]);
+  useEffect(() => { keyIdxRef.current   = keyIdx;    }, [keyIdx]);
+  useEffect(() => { scaleIdRef.current  = scaleId;   }, [scaleId]);
+  useEffect(() => { pitchInfoRef.current = pitchInfo; }, [pitchInfo]);
+
+  // ── Init ──────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const ok = location.protocol === "https:" ||
+      ["localhost","127.0.0.1"].includes(location.hostname);
+    setShowHttps(!ok);
+    beatRef.current = new Audio();
+  }, []);
+
+  // Beat audio events
+  useEffect(() => {
+    const b = beatRef.current;
+    if (!b) return;
+    const onTime = () => setBeatCurrentTime(b.currentTime);
+    const onMeta = () => setBeatDuration(b.duration || 0);
+    const onEnd  = () => setBeatPlaying(false);
+    b.addEventListener("timeupdate", onTime);
+    b.addEventListener("loadedmetadata", onMeta);
+    b.addEventListener("ended", onEnd);
+    return () => {
+      b.removeEventListener("timeupdate", onTime);
+      b.removeEventListener("loadedmetadata", onMeta);
+      b.removeEventListener("ended", onEnd);
+    };
+  }, []);
+
+  // ── Waveform + VU + pitch display (single 60fps loop) ─────────────────────
+  useEffect(() => {
+    const canvas = wvCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const draw = () => {
+      const an = analyserRef.current;
+      const w = canvas.width, h = canvas.height;
+      ctx.fillStyle = "#161622";
+      ctx.fillRect(0, 0, w, h);
+
+      if (an) {
+        const buf = new Float32Array(an.fftSize);
+        an.getFloatTimeDomainData(buf);
+
+        // Waveform
+        ctx.beginPath();
+        ctx.strokeStyle = "#a855f7";
+        ctx.lineWidth = 1.5;
+        ctx.shadowColor = "#a855f7";
+        ctx.shadowBlur = 5;
+        for (let i = 0; i < buf.length; i++) {
+          const x = (i / buf.length) * w;
+          const y = h / 2 + buf[i] * h * 0.38;
+          i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+
+        // VU meters
+        let rms = 0;
+        for (let i = 0; i < buf.length; i++) rms += buf[i] * buf[i];
+        rms = Math.sqrt(rms / buf.length);
+        const vuPct = Math.min(rms * 350, 100).toFixed(1);
+        if (vuMicRef.current) vuMicRef.current.style.width = `${vuPct}%`;
+        if (vuRecRef.current) vuRecRef.current.style.width = isRecRef.current ? `${vuPct}%` : "0%";
+
+        // Pitch display — direct DOM for zero-lag 60fps updates
+        const pi = pitchInfoRef.current;
+        if (pi && pi.hz > 0 && pi.confidence > 0.4) {
+          if (inNoteRef.current)  inNoteRef.current.textContent  = pi.noteName;
+          if (inHzRef.current)    inHzRef.current.textContent    = `${Math.round(pi.hz)} Hz`;
+          const corrHz   = snapToScale(pi.hz, keyIdxRef.current, scaleIdRef.current);
+          const corrMidi = hzToMidi(corrHz);
+          const corrNote = NOTES[((Math.round(corrMidi) % 12) + 12) % 12];
+          if (outNoteRef.current) outNoteRef.current.textContent = corrNote;
+          if (outHzRef.current)   outHzRef.current.textContent   = `${Math.round(corrHz)} Hz`;
+          const c = Math.max(-50, Math.min(50, pi.cents ?? 0));
+          if (centsNumRef.current) centsNumRef.current.textContent = `${c > 0 ? "+" : ""}${c}¢`;
+          if (mbarRef.current) {
+            const pct = (Math.abs(c) / 50) * 50;
+            const col = Math.abs(c) < 10 ? "#22d3a5" : Math.abs(c) < 25 ? "#fbbf24" : "#f43f5e";
+            mbarRef.current.style.width      = `${pct}%`;
+            mbarRef.current.style.left       = c >= 0 ? "50%" : `${50 - pct}%`;
+            mbarRef.current.style.background = col;
+            mbarRef.current.style.boxShadow  = `0 0 8px ${col}`;
+          }
+        } else {
+          if (inNoteRef.current)   inNoteRef.current.textContent   = "—";
+          if (inHzRef.current)     inHzRef.current.textContent     = "— Hz";
+          if (outNoteRef.current)  outNoteRef.current.textContent  = "—";
+          if (outHzRef.current)    outHzRef.current.textContent    = "— Hz";
+          if (centsNumRef.current) centsNumRef.current.textContent = "0¢";
+          if (mbarRef.current)     mbarRef.current.style.width     = "0";
+        }
+      }
+      wvAnimRef.current = requestAnimationFrame(draw);
+    };
+    wvAnimRef.current = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(wvAnimRef.current);
+  }, []); // empty — all live data via refs
+
+  // ── Pitch history graph ────────────────────────────────────────────────────
+  useEffect(() => {
+    const canvas = pgCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    let raf: number;
+    const draw = () => {
+      const trail = trailRef.current;
+      const w = canvas.width, h = canvas.height;
+      ctx.fillStyle = "#161622";
+      ctx.fillRect(0, 0, w, h);
+      // Center dashed line
+      ctx.strokeStyle = "#22223a";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2); ctx.stroke();
+      ctx.setLineDash([]);
+      if (trail.length > 1) {
+        ctx.beginPath();
+        ctx.strokeStyle = "#e879f9";
+        ctx.lineWidth = 1.5;
+        ctx.shadowColor = "#e879f9";
+        ctx.shadowBlur = 4;
+        for (let i = 0; i < trail.length; i++) {
+          const x = (i / 200) * w;
+          const y = h / 2 - (trail[i] / 50) * (h / 2 - 2);
+          i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+      }
+      raf = requestAnimationFrame(draw);
+    };
+    raf = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
+  // Update trail when pitch changes
+  useEffect(() => {
+    if (pitchInfo && pitchInfo.hz > 0 && pitchInfo.confidence > 0.5) {
+      trailRef.current.push(pitchInfo.cents ?? 0);
+      if (trailRef.current.length > 200) trailRef.current.shift();
+    }
+  }, [pitchInfo]);
+
+  // ── Worklet param sync (live while session on) ─────────────────────────────
+  useEffect(() => { if (isOn) engineRef.current?.setWorkletParam("retuneSpeed", speed); }, [speed, isOn]);
+  useEffect(() => { if (isOn) engineRef.current?.setWorkletParam("humanize", humanize / 100); }, [humanize, isOn]);
+  useEffect(() => { if (isOn) engineRef.current?.setWorkletParam("key", keyIdx); }, [keyIdx, isOn]);
+  useEffect(() => {
+    if (isOn) {
+      const si = SCALE_KEYS.indexOf(scaleId);
+      engineRef.current?.setWorkletParam("scale", si >= 0 ? si : 4);
+    }
+  }, [scaleId, isOn]);
+  useEffect(() => {
+    if (isOn) engineRef.current?.setWorkletParam("bypass", (!tuneOn || bypassOn) ? 1 : 0);
+  }, [tuneOn, bypassOn, isOn]);
+  useEffect(() => { if (isOn) engineRef.current?.setWorkletParam("inputGain", micGain / 100); }, [micGain, isOn]);
+  useEffect(() => {
+    if (beatRef.current) beatRef.current.volume = Math.min(beatVol / 100, 1);
+  }, [beatVol]);
+
+  // ── Beat handlers ──────────────────────────────────────────────────────────
+  const loadBeatFile = useCallback((file: File) => {
+    const b = beatRef.current;
+    if (!b) return;
+    if (b.src.startsWith("blob:")) URL.revokeObjectURL(b.src);
+    b.src = URL.createObjectURL(file);
+    b.volume = beatVol / 100;
+    setBeatLoaded(true);
+    setBeatFilename(file.name);
+    setBeatPlaying(false);
+    setBeatCurrentTime(0);
+    setStatusMsg("Beat loaded — tap START then ▶ Play");
+    setStatusDot("warn");
+  }, [beatVol]);
+
+  const togglePlay = useCallback(() => {
+    const b = beatRef.current;
+    if (!b || !beatLoaded) return;
+    if (b.paused) { b.play(); setBeatPlaying(true); }
+    else { b.pause(); setBeatPlaying(false); }
+  }, [beatLoaded]);
+
+  const toggleLoop = useCallback(() => {
+    const b = beatRef.current;
+    if (!b) return;
+    const next = !beatLoop;
+    b.loop = next;
+    setBeatLoop(next);
+  }, [beatLoop]);
+
+  const restartTrack = useCallback(() => {
+    const b = beatRef.current;
+    if (!b) return;
+    b.currentTime = 0;
+    if (b.paused) { b.play(); setBeatPlaying(true); }
+  }, []);
+
+  const seekTrack = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    const b = beatRef.current;
+    if (!b || !beatLoaded || !beatDuration) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    b.currentTime = ((e.clientX - rect.left) / rect.width) * beatDuration;
+  }, [beatLoaded, beatDuration]);
+
+  // ── Session handlers ───────────────────────────────────────────────────────
+  const startSession = useCallback(async () => {
     try {
+      setStatusMsg("Requesting mic access…");
+      setStatusDot("warn");
       const engine = AudioEngine.getInstance();
       engineRef.current = engine;
       engine.onPitchUpdate = setPitchInfo;
-      engine.onStateChange = (s) => {
-        if (s === "error") setAppState("error");
-        else if (s === "recording") setAppState("recording");
-        else if (s === "ready") setAppState("ready");
-      };
       engine.onRecordingComplete = (blob) => {
         const url = URL.createObjectURL(blob);
-        setRecordings((prev) => [{ blob, url, ts: Date.now() }, ...prev]);
+        setRecordings(p => [{ blob, url, ts: Date.now() }, ...p]);
       };
-
-      await engine.init();
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : "Init failed");
-      setAppState("error");
+      if (engine.state === "idle") await engine.init();
+      await engine.startMic();
+      setAnalyser(engine.analyserNode);
+      // Push current control values into worklet
+      engine.setWorkletParam("retuneSpeed", speed);
+      engine.setWorkletParam("humanize", humanize / 100);
+      engine.setWorkletParam("key", keyIdx);
+      engine.setWorkletParam("scale", Math.max(0, SCALE_KEYS.indexOf(scaleId)));
+      engine.setWorkletParam("bypass", (!tuneOn || bypassOn) ? 1 : 0);
+      engine.setWorkletParam("inputGain", micGain / 100);
+      setIsOn(true);
+      setStatusMsg("Live — voice processed through Auto-Tune");
+      setStatusDot("on");
+    } catch (e) {
+      setStatusMsg(e instanceof Error ? e.message : "Mic access denied");
+      setStatusDot("warn");
     }
-  }, []);
+  }, [speed, humanize, keyIdx, scaleId, tuneOn, bypassOn, micGain]);
 
-  // ── Mic control ──────────────────────────────────────────────────────────
-  const toggleMic = useCallback(async () => {
-    const engine = engineRef.current;
-    if (!engine) return;
-
-    if (!micActive) {
-      try {
-        await engine.startMic();
-        setAnalyser(engine.analyserNode);
-        engine.applyPreset(currentPreset);
-        setMicActive(true);
-        setAppState("ready");
-      } catch (err) {
-        setErrorMsg(err instanceof Error ? err.message : "Mic access denied");
-        setAppState("error");
-      }
-    } else {
-      engine.stopMic();
-      setMicActive(false);
-      setAnalyser(null);
-      setPitchInfo(null);
+  const stopSession = useCallback(() => {
+    if (isRec) {
+      engineRef.current?.stopRecording();
+      setIsRec(false);
+      isRecRef.current = false;
     }
-  }, [micActive, currentPreset]);
+    engineRef.current?.stopMic();
+    setAnalyser(null);
+    setIsOn(false);
+    setPitchInfo(null);
+    pitchInfoRef.current = null;
+    trailRef.current = [];
+    setStatusMsg("Session stopped");
+    setStatusDot("off");
+  }, [isRec]);
 
-  // ── Preset application ───────────────────────────────────────────────────
-  const applyPreset = useCallback((preset: VocalPreset) => {
-    setCurrentPreset(preset);
-    setRetuneSpeed(preset.retuneSpeed);
-    setHumanize(preset.humanize);
-    setReverbWet(preset.reverbWet);
-    setCompThreshold(preset.compThreshold);
-    setSelectedKey(preset.key);
-    setSelectedScale(preset.scale);
-    engineRef.current?.applyPreset(preset);
-  }, []);
-
-  // ── Beat loading ─────────────────────────────────────────────────────────
-  const handleBeatFile = useCallback(async (file: File) => {
-    const engine = engineRef.current;
-    if (!engine) return;
-    await engine.loadBeat(file);
-    setBeatLoaded(true);
-    setBeatFilename(file.name);
-    setBeatAnalyser(engine.beatAnalyserNode);
-  }, []);
-
-  const toggleBeat = useCallback(() => {
-    const engine = engineRef.current;
-    if (!engine || !beatLoaded) return;
-    if (beatPlaying) {
-      engine.stopBeat();
-      setBeatPlaying(false);
-    } else {
-      engine.playBeat();
-      setBeatPlaying(true);
-    }
-  }, [beatPlaying, beatLoaded]);
-
-  // ── Recording ────────────────────────────────────────────────────────────
   const toggleRecord = useCallback(() => {
-    const engine = engineRef.current;
-    if (!engine || !micActive) return;
-    if (appState === "recording") {
-      engine.stopRecording();
+    if (!isOn) return;
+    if (isRec) {
+      engineRef.current?.stopRecording();
+      setIsRec(false);
+      isRecRef.current = false;
+      setStatusDot("on");
+      setStatusMsg("Recording saved — see below");
     } else {
-      engine.startRecording();
+      engineRef.current?.startRecording();
+      setIsRec(true);
+      isRecRef.current = true;
+      setStatusDot("rec");
+      setStatusMsg("Recording…");
     }
-  }, [appState, micActive]);
+  }, [isOn, isRec]);
 
-  // ── Knob handlers ────────────────────────────────────────────────────────
-  const handleRetuneSpeed = useCallback((v: number) => {
-    setRetuneSpeed(v);
-    engineRef.current?.setRetuneSpeed(v);
-  }, []);
-  const handleHumanize = useCallback((v: number) => {
-    setHumanize(v);
-    engineRef.current?.setHumanize(v);
-  }, []);
-  const handleMasterVol = useCallback((v: number) => {
-    setMasterVol(v);
-    engineRef.current?.setMasterVolume(v);
-  }, []);
-  const handleBeatVol = useCallback((v: number) => {
-    setBeatVol(v);
-    engineRef.current?.setBeatVolume(v);
-  }, []);
+  // ── Derived values ─────────────────────────────────────────────────────────
+  const scaleIvs    = SCALE_INTERVALS[scaleId] ?? SCALE_INTERVALS.chromatic;
+  const progressPct = beatDuration > 0 ? (beatCurrentTime / beatDuration) * 100 : 0;
 
-  // ── Drag and drop ─────────────────────────────────────────────────────────
-  const handleDrop = useCallback(
-    (e: React.DragEvent) => {
-      e.preventDefault();
-      const file = e.dataTransfer.files[0];
-      if (file && (file.type.startsWith("audio/") || file.name.match(/\.(mp3|wav|ogg|flac|aac)$/i))) {
-        handleBeatFile(file);
-      }
-    },
-    [handleBeatFile]
-  );
+  // Dot colors
+  const dotColor = statusDot === "on" ? "#22d3a5" : statusDot === "rec" ? "#f43f5e" : statusDot === "warn" ? "#fbbf24" : "#5a5a7a";
+  const dotShadow = statusDot !== "off" ? `0 0 8px ${dotColor}` : "none";
 
+  // ── Render ─────────────────────────────────────────────────────────────────
   return (
-    <div className="min-h-screen bg-[#06060f] text-white font-sans flex flex-col">
-      {/* ── Header ── */}
-      <header className="flex items-center justify-between px-6 py-4 border-b border-[#1a1a3a]">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-purple-600 to-pink-600 flex items-center justify-center">
-            <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" />
-            </svg>
-          </div>
-          <div>
-            <h1 className="text-lg font-black tracking-tight bg-gradient-to-r from-purple-400 to-pink-400 bg-clip-text text-transparent">
-              AutoTune Studio
-            </h1>
-            <p className="text-[10px] text-slate-500 -mt-0.5">Professional Vocal Processing</p>
-          </div>
+    <div style={{ background:"#080810", color:"#ededf5", minHeight:"100vh", display:"flex", flexDirection:"column", alignItems:"center", padding:"14px 12px 40px", gap:"12px", fontFamily:"'Space Grotesk', sans-serif" }}>
+
+      {/* ══ HEADER ══════════════════════════════════════════════════════════ */}
+      <div style={{ width:"100%", maxWidth:"480px", display:"flex", alignItems:"center", justifyContent:"space-between", paddingBottom:"10px", borderBottom:"1px solid #22223a" }}>
+        <div style={{ ...mono, fontSize:"1.15rem", fontWeight:700, letterSpacing:"0.04em" }}>
+          VOCAL<span style={{ color:"#e879f9" }}>BOOTH</span>
         </div>
-
-        <div className="flex items-center gap-3">
-          {/* Status badge */}
-          <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs border transition-all ${
-            appState === "recording"
-              ? "bg-red-500/10 border-red-500/30 text-red-400"
-              : micActive
-              ? "bg-green-500/10 border-green-500/30 text-green-400"
-              : "bg-slate-800/50 border-slate-700 text-slate-500"
-          }`}>
-            <div className={`w-1.5 h-1.5 rounded-full ${
-              appState === "recording" ? "bg-red-500 animate-pulse" :
-              micActive ? "bg-green-500" : "bg-slate-600"
-            }`} />
-            {appState === "recording" ? "RECORDING" : micActive ? "LIVE" : "OFFLINE"}
-          </div>
-
-          {/* Bypass toggle */}
-          <button
-            id="bypass-btn"
-            onClick={() => { setBypass(!bypass); engineRef.current?.setBypass(!bypass); }}
-            className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-all ${
-              bypass
-                ? "bg-amber-500/10 border-amber-500/30 text-amber-400"
-                : "bg-slate-800/50 border-slate-700 text-slate-500 hover:text-slate-300"
-            }`}
-          >
-            {bypass ? "BYPASSED" : "BYPASS"}
-          </button>
+        <div style={{ ...mono, fontSize:"0.6rem", background:"#7c3aed", color:"#fff", padding:"3px 9px", borderRadius:"20px", letterSpacing:"0.1em" }}>
+          AUTO-TUNE PRO
         </div>
-      </header>
+      </div>
 
-      {/* ── Error Banner ── */}
-      {appState === "error" && (
-        <div className="mx-6 mt-4 px-4 py-3 bg-red-500/10 border border-red-500/30 rounded-xl text-sm text-red-400">
-          ⚠️ {errorMsg || "An audio error occurred."}
+      {/* ══ HTTPS WARNING ═══════════════════════════════════════════════════ */}
+      {showHttps && (
+        <div style={{ width:"100%", maxWidth:"480px", background:"rgba(251,191,36,0.08)", border:"1px solid rgba(251,191,36,0.3)", borderRadius:"10px", padding:"12px 14px", fontSize:"0.75rem", color:"#fbbf24", lineHeight:1.5 }}>
+          <strong style={{ display:"block", marginBottom:"4px" }}>⚠️ Microphone blocked</strong>
+          Open via HTTPS to enable the mic. Run <code>npm run dev</code> on localhost or deploy to Vercel for a free HTTPS link.
         </div>
       )}
 
-      <main className="flex-1 grid grid-cols-[280px_1fr_260px] gap-0 overflow-hidden">
-        {/* ═══ LEFT PANEL — Controls ═══ */}
-        <aside className="border-r border-[#1a1a3a] p-5 flex flex-col gap-5 overflow-y-auto">
-          {/* Preset selector */}
-          <PresetSelector onSelect={applyPreset} currentPreset={currentPreset} />
+      {/* ══ STATUS ══════════════════════════════════════════════════════════ */}
+      <div style={{ width:"100%", maxWidth:"480px", background:"#101018", border:"1px solid #22223a", borderRadius:"10px", padding:"9px 14px", display:"flex", alignItems:"center", gap:"10px", ...mono, fontSize:"0.7rem" }}>
+        <div style={{ width:"7px", height:"7px", borderRadius:"50%", flexShrink:0, transition:"background 0.3s, box-shadow 0.3s", background:dotColor, boxShadow:dotShadow, animation: statusDot==="rec" ? "vb-blink 0.7s infinite" : "none" }} />
+        <div style={{ flex:1, color:"#5a5a7a" }}>{statusMsg}</div>
+      </div>
 
-          {/* Key / Scale */}
-          <div className="bg-[#0a0a18] border border-[#1a1a3a] rounded-xl p-4 flex flex-col gap-3">
-            <span className="text-[10px] uppercase tracking-widest text-slate-500">Key & Scale</span>
-            <div className="grid grid-cols-4 gap-1">
-              {KEY_NAMES.map((k, i) => (
-                <button
-                  key={k}
-                  id={`key-${k}`}
-                  onClick={() => { setSelectedKey(i); engineRef.current?.setKey(i); }}
-                  className={`py-1.5 rounded-lg text-xs font-medium transition-all ${
-                    selectedKey === i
-                      ? "bg-purple-600 text-white shadow-lg shadow-purple-900/50"
-                      : "bg-[#1a1a2e] text-slate-400 hover:bg-[#2a2a4e] hover:text-white"
-                  }`}
-                >
-                  {k}
+      {/* ══ PITCH DISPLAY ════════════════════════════════════════════════════ */}
+      <div style={card}>
+        <div style={cardTitle}>Live Pitch Monitor</div>
+        <div style={{ display:"flex", alignItems:"center", width:"100%" }}>
+
+          {/* Input note */}
+          <div style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", gap:"3px" }}>
+            <div style={{ fontSize:"0.55rem", color:"#5a5a7a", letterSpacing:"0.1em", textTransform:"uppercase" }}>You&apos;re Singing</div>
+            <div ref={inNoteRef} style={{ ...mono, fontSize:"2.4rem", fontWeight:700, lineHeight:1, color:"#e879f9", textShadow:"0 0 18px rgba(168,85,247,0.35)", minWidth:"72px", textAlign:"center", transition:"color 0.15s" }}>—</div>
+            <div ref={inHzRef}   style={{ ...mono, fontSize:"0.65rem", color:"#5a5a7a" }}>— Hz</div>
+          </div>
+
+          {/* Divider */}
+          <div style={{ width:"1px", height:"60px", background:"#22223a", flexShrink:0, margin:"0 10px" }} />
+
+          {/* Cents meter + pitch graph */}
+          <div style={{ flex:2 }}>
+            <div style={{ fontSize:"0.55rem", color:"#5a5a7a", letterSpacing:"0.1em", textTransform:"uppercase", marginBottom:"6px" }}>Pitch Deviation</div>
+            {/* Meter bar */}
+            <div style={{ position:"relative", height:"16px", background:"#161622", borderRadius:"8px", border:"1px solid #22223a", overflow:"hidden" }}>
+              <div style={{ position:"absolute", left:"50%", top:0, bottom:0, width:"1px", background:"#22223a", zIndex:2 }} />
+              <div ref={mbarRef} style={{ position:"absolute", top:"3px", bottom:"3px", borderRadius:"5px", transition:"left 0.04s, width 0.04s, background 0.15s", left:"50%", width:0, background:"#22d3a5" }} />
+            </div>
+            <div ref={centsNumRef} style={{ ...mono, fontSize:"0.65rem", color:"#5a5a7a", marginTop:"4px" }}>0¢</div>
+            {/* Pitch graph */}
+            <canvas ref={pgCanvasRef} width={220} height={52} style={{ width:"100%", height:"52px", display:"block", borderRadius:"6px", marginTop:"8px", background:"#161622" }} />
+          </div>
+
+          {/* Divider */}
+          <div style={{ width:"1px", height:"60px", background:"#22223a", flexShrink:0, margin:"0 10px" }} />
+
+          {/* Corrected note */}
+          <div style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", gap:"3px" }}>
+            <div style={{ fontSize:"0.55rem", color:"#5a5a7a", letterSpacing:"0.1em", textTransform:"uppercase" }}>Corrected To</div>
+            <div ref={outNoteRef} style={{ ...mono, fontSize:"2.4rem", fontWeight:700, lineHeight:1, color:"#22d3a5", minWidth:"72px", textAlign:"center", transition:"color 0.15s" }}>—</div>
+            <div ref={outHzRef}   style={{ ...mono, fontSize:"0.65rem", color:"#5a5a7a" }}>— Hz</div>
+          </div>
+        </div>
+      </div>
+
+      {/* ══ BACKING TRACK ════════════════════════════════════════════════════ */}
+      <div style={card}>
+        <div style={cardTitle}>Backing Track</div>
+
+        {/* Drop zone */}
+        <div
+          onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={e => { e.preventDefault(); setDragOver(false); const f = e.dataTransfer.files[0]; if (f) loadBeatFile(f); }}
+          onClick={() => fileInputRef.current?.click()}
+          style={{ border:`1.5px dashed ${dragOver ? "#a855f7" : "#22223a"}`, borderRadius:"10px", padding:"18px", textAlign:"center", cursor:"pointer", transition:"border-color 0.2s, background 0.2s", background: dragOver ? "rgba(168,85,247,0.05)" : "transparent", position:"relative" }}
+        >
+          <input ref={fileInputRef} type="file" accept="audio/*" style={{ display:"none" }} onChange={e => { const f = e.target.files?.[0]; if (f) loadBeatFile(f); }} />
+          <div style={{ fontSize:"1.6rem", marginBottom:"6px" }}>🎵</div>
+          <div style={{ fontSize:"0.8rem", color:"#5a5a7a" }}>
+            <strong style={{ color:"#ededf5" }}>Tap to load your beat</strong><br/>MP3, WAV, AAC supported
+          </div>
+        </div>
+
+        {/* File info */}
+        {beatLoaded && (
+          <div style={{ display:"flex", alignItems:"center", gap:"12px", background:"#161622", borderRadius:"10px", padding:"12px", marginTop:"10px" }}>
+            <div style={{ fontSize:"1.5rem" }}>🎧</div>
+            <div style={{ flex:1, overflow:"hidden" }}>
+              <div style={{ fontSize:"0.8rem", fontWeight:600, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{beatFilename}</div>
+              <div style={{ ...mono, fontSize:"0.65rem", color:"#5a5a7a" }}>{fmtTime(beatDuration)}</div>
+            </div>
+          </div>
+        )}
+
+        {/* Controls */}
+        {beatLoaded && (
+          <>
+            <div style={{ display:"flex", alignItems:"center", gap:"8px", marginTop:"10px" }}>
+              {[
+                { label: beatPlaying ? "⏸ Pause" : "▶ Play", action: togglePlay, active: beatPlaying },
+                { label: "⟳ Loop",                           action: toggleLoop,  active: beatLoop },
+                { label: "↺ Restart",                        action: restartTrack, active: false },
+              ].map(b => (
+                <button key={b.label} onClick={b.action} style={{ flex:1, background: b.active ? "#7c3aed" : "#161622", border:`1px solid ${b.active ? "#a855f7" : "#22223a"}`, color: b.active ? "#fff" : "#ededf5", borderRadius:"8px", padding:"8px 14px", fontSize:"0.8rem", cursor:"pointer", fontFamily:"'Space Grotesk', sans-serif", transition:"all 0.2s", textAlign:"center" }}>
+                  {b.label}
                 </button>
               ))}
             </div>
-            <div className="flex flex-col gap-1">
-              {SCALE_NAMES.map((s, i) => (
-                <button
-                  key={s}
-                  id={`scale-${i}`}
-                  onClick={() => { setSelectedScale(i); engineRef.current?.setScale(i); }}
-                  className={`py-1.5 px-3 rounded-lg text-xs text-left transition-all ${
-                    selectedScale === i
-                      ? "bg-purple-600/20 text-purple-300 border border-purple-500/30"
-                      : "text-slate-500 hover:text-slate-300"
-                  }`}
-                >
-                  {s}
-                </button>
-              ))}
+
+            {/* Progress bar */}
+            <div onClick={seekTrack} style={{ position:"relative", height:"4px", background:"#22223a", borderRadius:"2px", marginTop:"10px", cursor:"pointer" }}>
+              <div style={{ height:"100%", background:"linear-gradient(90deg,#7c3aed,#e879f9)", borderRadius:"2px", width:`${progressPct}%`, transition:"width 0.5s linear" }} />
+            </div>
+            <div style={{ display:"flex", justifyContent:"space-between", marginTop:"4px" }}>
+              <span style={{ ...mono, fontSize:"0.6rem", color:"#5a5a7a" }}>{fmtTime(beatCurrentTime)}</span>
+              <span style={{ ...mono, fontSize:"0.6rem", color:"#5a5a7a" }}>{fmtTime(beatDuration)}</span>
+            </div>
+
+            {/* Volume */}
+            <div style={{ display:"flex", alignItems:"center", gap:"8px", marginTop:"8px" }}>
+              <div style={{ fontSize:"0.7rem", color:"#5a5a7a", minWidth:"80px" }}>Beat Volume</div>
+              <input type="range" className="vb-slider" min="0" max="150" value={beatVol} onChange={e => setBeatVol(Number(e.target.value))} style={{ flex:1 }} />
+              <div style={{ ...mono, fontSize:"0.65rem", minWidth:"34px", textAlign:"right" }}>{beatVol}%</div>
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* ══ AUTO-TUNE SETTINGS ═══════════════════════════════════════════════ */}
+      <div style={card}>
+        <div style={cardTitle}>Auto-Tune Engine</div>
+
+        {/* Key + Scale */}
+        <div style={{ display:"flex", gap:"8px", marginBottom:"10px" }}>
+          <select className="vb-select" value={keyIdx} onChange={e => setKeyIdx(Number(e.target.value))}>
+            {NOTES.map((n, i) => <option key={n} value={i}>{n}</option>)}
+          </select>
+          <select className="vb-select" value={scaleId} onChange={e => setScaleId(e.target.value)}>
+            {SCALE_KEYS.map((k, i) => <option key={k} value={k}>{SCALE_LABELS[i]}</option>)}
+          </select>
+        </div>
+
+        {/* Scale dots */}
+        <div style={{ display:"flex", gap:"4px", flexWrap:"wrap", marginBottom:"14px" }}>
+          {NOTES.map((n, i) => {
+            const lit = scaleIvs.includes(((i - keyIdx) % 12 + 12) % 12);
+            return (
+              <div key={n} style={{ width:"30px", height:"30px", borderRadius:"6px", background: lit ? "#7c3aed" : "#161622", border:`1px solid ${lit ? "#a855f7" : "#22223a"}`, display:"flex", alignItems:"center", justifyContent:"center", ...mono, fontSize:"0.55rem", color: lit ? "#fff" : "#5a5a7a", transition:"all 0.2s", boxShadow: lit ? "0 0 8px rgba(168,85,247,0.35)" : "none" }}>
+                {n}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Sliders */}
+        {[
+          { label:"Retune Speed",            value:speed,    set:setSpeed,    min:1,   max:100, suffix:"" },
+          { label:"Humanize",                value:humanize, set:setHumanize, min:0,   max:100, suffix:"" },
+          { label:"Transpose (semitones)",   value:xpose,    set:setXpose,    min:-12, max:12,  suffix:" st" },
+          { label:"Correction Threshold",    value:thresh,   set:setThresh,   min:0,   max:50,  suffix:"¢" },
+        ].map(s => (
+          <div key={s.label} style={{ display:"flex", alignItems:"center", gap:"8px", marginBottom:"10px" }}>
+            <div style={{ fontSize:"0.72rem", color:"#5a5a7a", flex:1 }}>{s.label}</div>
+            <input type="range" className="vb-slider" min={s.min} max={s.max} value={s.value}
+              onChange={e => s.set(Number(e.target.value))} style={{ flex:2 }} />
+            <div style={{ ...mono, fontSize:"0.65rem", minWidth:"38px", textAlign:"right" }}>{s.value}{s.suffix}</div>
+          </div>
+        ))}
+
+        {/* Toggles */}
+        <div style={{ display:"flex", gap:"8px", marginTop:"8px", flexWrap:"wrap" }}>
+          {[
+            { label: tuneOn ? "Auto-Tune ON" : "Auto-Tune OFF", active:tuneOn,    action:() => setTuneOn(!tuneOn) },
+            { label: "Vibrato",                                  active:vibratoOn, action:() => setVibratoOn(!vibratoOn) },
+            { label: "Bypass",                                   active:bypassOn,  action:() => setBypassOn(!bypassOn) },
+          ].map(t => (
+            <button key={t.label} onClick={t.action} style={{ flex:1, padding:"8px", borderRadius:"8px", border:`1px solid ${t.active ? "#a855f7" : "#22223a"}`, background: t.active ? "#7c3aed" : "#161622", color: t.active ? "#fff" : "#5a5a7a", fontFamily:"'Space Grotesk', sans-serif", fontSize:"0.72rem", cursor:"pointer", transition:"all 0.2s", textAlign:"center", boxShadow: t.active ? "0 0 10px rgba(168,85,247,0.35)" : "none" }}>
+              {t.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* ══ WAVEFORM + VU ════════════════════════════════════════════════════ */}
+      <div style={card}>
+        <div style={cardTitle}>
+          Mic Input Monitor{" "}
+          <span style={{ textTransform:"none", opacity:0.6 }}>(your voice only — not in your ears)</span>
+        </div>
+        <canvas ref={wvCanvasRef} width={448} height={64} style={{ width:"100%", height:"64px", display:"block", borderRadius:"6px", background:"#161622" }} />
+
+        {/* VU meters */}
+        {[{ label:"MIC", ref:vuMicRef }, { label:"REC", ref:vuRecRef }].map(v => (
+          <div key={v.label} style={{ display:"flex", alignItems:"center", gap:"8px", marginTop:"8px" }}>
+            <div style={{ ...mono, fontSize:"0.6rem", color:"#5a5a7a", minWidth:"24px" }}>{v.label}</div>
+            <div style={{ flex:1, height:"6px", background:"#161622", borderRadius:"3px", overflow:"hidden" }}>
+              <div ref={v.ref} style={{ height:"100%", borderRadius:"3px", background:"linear-gradient(90deg,#22d3a5,#fbbf24,#f43f5e)", width:"0%", transition:"width 0.05s" }} />
             </div>
           </div>
+        ))}
 
-          {/* Pitch controls */}
-          <div className="bg-[#0a0a18] border border-[#1a1a3a] rounded-xl p-4 flex flex-col gap-4">
-            <span className="text-[10px] uppercase tracking-widest text-slate-500">Autotune</span>
-            <div className="flex justify-around">
-              <Knob value={retuneSpeed} min={0} max={200} step={1} label="Retune" unit="ms" onChange={handleRetuneSpeed} color="#a855f7" />
-              <Knob value={humanize} min={0} max={1} step={0.01} label="Humanize" onChange={handleHumanize} color="#ec4899" />
-            </div>
-            {/* Retune speed visual feedback */}
-            <div className="text-center">
-              <span className={`text-[10px] px-2 py-0.5 rounded-full ${
-                retuneSpeed < 5 ? "bg-red-500/20 text-red-400" :
-                retuneSpeed < 30 ? "bg-orange-500/20 text-orange-400" :
-                retuneSpeed < 80 ? "bg-yellow-500/20 text-yellow-400" :
-                "bg-green-500/20 text-green-400"
-              }`}>
-                {retuneSpeed < 5 ? "🎯 Robotic (Drill)" :
-                 retuneSpeed < 30 ? "⚡ Tight (Trap)" :
-                 retuneSpeed < 80 ? "🎵 Musical" : "🌿 Natural"}
-              </span>
-            </div>
-          </div>
-        </aside>
+        {/* Mic gain */}
+        <div style={{ display:"flex", alignItems:"center", gap:"8px", marginTop:"10px" }}>
+          <div style={{ fontSize:"0.7rem", color:"#5a5a7a", minWidth:"80px" }}>Mic Input Gain</div>
+          <input type="range" className="vb-slider" min="0" max="300" value={micGain}
+            onChange={e => setMicGain(Number(e.target.value))} style={{ flex:1 }} />
+          <div style={{ ...mono, fontSize:"0.65rem", minWidth:"34px", textAlign:"right" }}>{micGain}%</div>
+        </div>
+      </div>
 
-        {/* ═══ CENTER PANEL — Main Stage ═══ */}
-        <section className="flex flex-col gap-0 overflow-hidden">
-          {/* Waveform */}
-          <div className="p-5 pb-3">
-            <Waveform analyser={analyser} beatAnalyser={beatAnalyser} isRecording={appState === "recording"} />
-          </div>
+      {/* ══ TRANSPORT BUTTONS ════════════════════════════════════════════════ */}
+      <div style={{ width:"100%", maxWidth:"480px", display:"flex", gap:"10px" }}>
+        {/* START */}
+        <button
+          id="start-btn"
+          onClick={startSession}
+          disabled={isOn}
+          style={{ flex:1, padding:"15px 10px", borderRadius:"12px", border:"none", fontFamily:"'Space Grotesk', sans-serif", fontSize:"0.88rem", fontWeight:600, cursor: isOn ? "not-allowed" : "pointer", transition:"all 0.2s", letterSpacing:"0.02em", background:"linear-gradient(135deg,#7c3aed,#a855f7)", color:"#fff", boxShadow:"0 4px 20px rgba(168,85,247,0.35)", opacity: isOn ? 0.35 : 1, animation: !isOn ? "vb-startpulse 2s infinite" : "none" }}
+        >▶ START</button>
 
-          {/* Pitch meter */}
-          <div className="px-5 pb-3">
-            <PitchMeter pitchInfo={pitchInfo} />
-          </div>
+        {/* REC */}
+        <button
+          id="rec-btn"
+          onClick={toggleRecord}
+          disabled={!isOn}
+          style={{ flex:1, padding:"15px 10px", borderRadius:"12px", border:`1px solid ${isRec ? "#f43f5e" : "rgba(244,63,94,0.3)"}`, fontFamily:"'Space Grotesk', sans-serif", fontSize:"0.88rem", fontWeight:600, cursor: !isOn ? "not-allowed" : "pointer", transition:"all 0.2s", letterSpacing:"0.02em", background: isRec ? "rgba(244,63,94,0.15)" : "#101018", color:"#f43f5e", opacity: !isOn ? 0.3 : 1, animation: isRec ? "vb-recpulse 1s infinite" : "none" }}
+        >⏺ REC</button>
 
-          {/* Transport controls */}
-          <div className="px-5 pb-5 flex items-center justify-center gap-4">
-            {/* Init / Mic button */}
-            {appState === "idle" ? (
+        {/* STOP */}
+        <button
+          id="stop-btn"
+          onClick={stopSession}
+          disabled={!isOn}
+          style={{ flex:1, padding:"15px 10px", borderRadius:"12px", border:"1px solid #22223a", fontFamily:"'Space Grotesk', sans-serif", fontSize:"0.88rem", fontWeight:600, cursor: !isOn ? "not-allowed" : "pointer", transition:"all 0.2s", letterSpacing:"0.02em", background:"#101018", color:"#ededf5", opacity: !isOn ? 0.3 : 1 }}
+        >■ STOP</button>
+      </div>
+
+      {/* ══ RECORDINGS ═══════════════════════════════════════════════════════ */}
+      {recordings.length > 0 && (
+        <div style={{ width:"100%", maxWidth:"480px" }}>
+          <div style={{ ...mono, fontSize:"0.6rem", color:"#5a5a7a", letterSpacing:"0.12em", textTransform:"uppercase", marginBottom:"8px" }}>Recordings</div>
+          {recordings.map(rec => (
+            <div key={rec.ts} style={{ display:"flex", alignItems:"center", gap:"10px", background:"#101018", border:"1px solid #22223a", borderRadius:"10px", padding:"10px", marginBottom:"8px" }}>
+              <audio controls src={rec.url} style={{ flex:1, height:"32px", accentColor:"#a855f7" }} />
               <button
-                id="init-btn"
-                onClick={initEngine}
-                className="px-8 py-3 bg-gradient-to-r from-purple-600 to-pink-600 rounded-xl font-semibold text-sm hover:from-purple-500 hover:to-pink-500 transition-all shadow-lg shadow-purple-900/50 hover:shadow-purple-900/80 hover:scale-105 active:scale-95"
-              >
-                Launch Studio
-              </button>
-            ) : (
-              <>
-                {/* Mic */}
-                <button
-                  id="mic-btn"
-                  onClick={toggleMic}
-                  className={`flex items-center gap-2 px-5 py-3 rounded-xl font-semibold text-sm transition-all ${
-                    micActive
-                      ? "bg-purple-600/20 border border-purple-500/40 text-purple-300 hover:bg-purple-600/30"
-                      : "bg-[#1a1a3a] border border-[#2a2a5a] text-slate-300 hover:border-purple-500/40 hover:text-purple-300"
-                  }`}
-                >
-                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
-                  </svg>
-                  {micActive ? "Mic On" : "Start Mic"}
-                </button>
-
-                {/* Beat play/stop */}
-                <button
-                  id="beat-play-btn"
-                  onClick={toggleBeat}
-                  disabled={!beatLoaded}
-                  className={`flex items-center gap-2 px-5 py-3 rounded-xl font-semibold text-sm transition-all disabled:opacity-40 disabled:cursor-not-allowed ${
-                    beatPlaying
-                      ? "bg-cyan-600/20 border border-cyan-500/40 text-cyan-300"
-                      : "bg-[#1a1a3a] border border-[#2a2a5a] text-slate-300 hover:border-cyan-500/40 hover:text-cyan-300"
-                  }`}
-                >
-                  {beatPlaying ? (
-                    <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
-                      <path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z" />
-                    </svg>
-                  ) : (
-                    <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
-                      <path d="M8 5v14l11-7z" />
-                    </svg>
-                  )}
-                  {beatPlaying ? "Stop Beat" : "Play Beat"}
-                </button>
-
-                {/* Record */}
-                <button
-                  id="record-btn"
-                  onClick={toggleRecord}
-                  disabled={!micActive}
-                  className={`flex items-center gap-2 px-5 py-3 rounded-xl font-semibold text-sm transition-all disabled:opacity-40 disabled:cursor-not-allowed ${
-                    appState === "recording"
-                      ? "bg-red-600 text-white shadow-lg shadow-red-900/60 animate-pulse"
-                      : "bg-[#1a1a3a] border border-[#2a2a5a] text-slate-300 hover:border-red-500/40 hover:text-red-400"
-                  }`}
-                >
-                  <div className={`w-3 h-3 rounded-full ${appState === "recording" ? "bg-white" : "bg-red-500"}`} />
-                  {appState === "recording" ? "Stop REC" : "Record"}
-                </button>
-              </>
-            )}
-          </div>
-
-          {/* Beat upload zone */}
-          <div
-            className="mx-5 mb-5 border border-dashed border-[#2a2a4a] rounded-xl p-4 text-center cursor-pointer hover:border-cyan-500/40 transition-all group"
-            onDrop={handleDrop}
-            onDragOver={(e) => e.preventDefault()}
-            onClick={() => beatInputRef.current?.click()}
-          >
-            <input
-              ref={beatInputRef}
-              type="file"
-              accept="audio/*"
-              className="hidden"
-              onChange={(e) => { const f = e.target.files?.[0]; if (f) handleBeatFile(f); }}
-            />
-            {beatLoaded ? (
-              <div className="flex items-center justify-center gap-3">
-                <div className="w-8 h-8 rounded-lg bg-cyan-500/20 flex items-center justify-center">
-                  <svg className="w-4 h-4 text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19V6l12-3v13" />
-                  </svg>
-                </div>
-                <div className="text-left">
-                  <p className="text-sm text-cyan-300 font-medium">{beatFilename}</p>
-                  <p className="text-[10px] text-slate-500">Beat loaded — click Play Beat to start</p>
-                </div>
-              </div>
-            ) : (
-              <div className="flex flex-col items-center gap-2">
-                <svg className="w-8 h-8 text-slate-600 group-hover:text-cyan-500/60 transition-colors" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-                </svg>
-                <p className="text-sm text-slate-500 group-hover:text-slate-400 transition-colors">Drop a beat here or click to browse</p>
-                <p className="text-[10px] text-slate-600">MP3, WAV, OGG, FLAC</p>
-              </div>
-            )}
-          </div>
-
-          {/* Recordings list */}
-          {recordings.length > 0 && (
-            <div className="mx-5 mb-5 flex flex-col gap-2">
-              <span className="text-[10px] uppercase tracking-widest text-slate-500 mb-1">Recordings</span>
-              {recordings.map((rec) => (
-                <div key={rec.ts} className="flex items-center gap-3 bg-[#0a0a18] border border-[#1a1a3a] rounded-lg px-3 py-2">
-                  <audio controls src={rec.url} className="flex-1 h-8" style={{ accentColor: "#a855f7" }} />
-                  <button
-                    onClick={() => engineRef.current?.exportAsWAV(rec.blob)}
-                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-purple-600/20 text-purple-300 text-xs hover:bg-purple-600/30 transition-colors border border-purple-500/30"
-                  >
-                    <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                    </svg>
-                    Export
-                  </button>
-                </div>
-              ))}
+                onClick={() => {
+                  const a = document.createElement("a");
+                  a.href = rec.url;
+                  a.download = `vocal-${rec.ts}.webm`;
+                  a.click();
+                }}
+                style={{ padding:"8px 12px", borderRadius:"8px", background:"rgba(168,85,247,0.15)", border:"1px solid rgba(168,85,247,0.3)", color:"#e879f9", fontSize:"0.75rem", cursor:"pointer", fontFamily:"'Space Grotesk', sans-serif", whiteSpace:"nowrap" }}
+              >↓ Export</button>
             </div>
-          )}
-        </section>
-
-        {/* ═══ RIGHT PANEL — Mixer ═══ */}
-        <aside className="border-l border-[#1a1a3a] p-5 flex flex-col gap-5 overflow-y-auto">
-          <span className="text-[10px] uppercase tracking-widest text-slate-500">Mixer</span>
-
-          {/* Volume knobs */}
-          <div className="bg-[#0a0a18] border border-[#1a1a3a] rounded-xl p-4">
-            <div className="flex justify-around">
-              <Knob value={masterVol} min={0} max={2} step={0.01} label="Vocal" onChange={handleMasterVol} color="#a855f7" size={56} />
-              <Knob value={beatVol} min={0} max={2} step={0.01} label="Beat" onChange={handleBeatVol} color="#06b6d4" size={56} />
-            </div>
-          </div>
-
-          {/* Compressor */}
-          <div className="bg-[#0a0a18] border border-[#1a1a3a] rounded-xl p-4 flex flex-col gap-3">
-            <span className="text-[10px] uppercase tracking-widest text-slate-500">Compressor</span>
-            <div className="flex justify-around flex-wrap gap-3">
-              <Knob
-                value={compThreshold}
-                min={-60} max={0} step={1}
-                label="Thresh" unit="dB"
-                onChange={(v) => setCompThreshold(v)}
-                color="#f97316" size={52}
-              />
-              <Knob
-                value={currentPreset.compRatio}
-                min={1} max={20} step={0.5}
-                label="Ratio"
-                onChange={() => {}}
-                color="#f97316" size={52}
-              />
-            </div>
-          </div>
-
-          {/* Reverb */}
-          <div className="bg-[#0a0a18] border border-[#1a1a3a] rounded-xl p-4 flex flex-col gap-3">
-            <span className="text-[10px] uppercase tracking-widest text-slate-500">Reverb</span>
-            <div className="flex justify-around">
-              <Knob
-                value={reverbWet}
-                min={0} max={1} step={0.01}
-                label="Wet"
-                onChange={(v) => { setReverbWet(v); }}
-                color="#22c55e" size={52}
-              />
-              <Knob
-                value={currentPreset.reverbDecay}
-                min={0.1} max={6} step={0.1}
-                label="Decay" unit="s"
-                onChange={() => {}}
-                color="#22c55e" size={52}
-              />
-            </div>
-          </div>
-
-          {/* EQ strip */}
-          <div className="bg-[#0a0a18] border border-[#1a1a3a] rounded-xl p-4 flex flex-col gap-3">
-            <span className="text-[10px] uppercase tracking-widest text-slate-500">EQ</span>
-            <div className="flex justify-around flex-wrap gap-2">
-              <Knob value={currentPreset.eqLowGain} min={-12} max={12} step={0.5} label="Low" unit="dB" onChange={() => {}} color="#eab308" size={48} />
-              <Knob value={currentPreset.eqMidGain} min={-12} max={12} step={0.5} label="Mid" unit="dB" onChange={() => {}} color="#eab308" size={48} />
-              <Knob value={currentPreset.eqHighGain} min={-12} max={12} step={0.5} label="High" unit="dB" onChange={() => {}} color="#eab308" size={48} />
-            </div>
-          </div>
-
-          {/* DSP info */}
-          <div className="bg-[#0a0a18] border border-[#1a1a3a] rounded-xl p-3 text-[9px] text-slate-600 space-y-1">
-            <div className="flex justify-between">
-              <span>Engine</span>
-              <span className="text-slate-500">
-                {retuneSpeed < 15 ? "OLA Fast Path" : "Phase Vocoder"}
-              </span>
-            </div>
-            <div className="flex justify-between">
-              <span>Latency</span>
-              <span className="text-slate-500">{retuneSpeed < 15 ? "~5ms" : "~23ms"}</span>
-            </div>
-            <div className="flex justify-between">
-              <span>Sample Rate</span>
-              <span className="text-slate-500">44.1 kHz</span>
-            </div>
-            <div className="flex justify-between">
-              <span>Block Size</span>
-              <span className="text-slate-500">128 samples</span>
-            </div>
-          </div>
-        </aside>
-      </main>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
