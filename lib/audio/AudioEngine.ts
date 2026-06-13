@@ -1,6 +1,20 @@
 // lib/audio/AudioEngine.ts
 // Singleton class that owns the entire Web Audio graph.
 // All DSP routing happens here. UI interacts only through public methods.
+//
+// ── CRITICAL DESIGN INVARIANT ──────────────────────────────────────────────
+// The processed vocal chain MUST NEVER connect to ctx.destination.
+// The user must NOT hear their own voice in headphones at any point.
+//
+// Signal chain:
+//   Mic → InputGain → rawAnalyser (for waveform vis only)
+//                  → Worklet → EQ → Compressor → Dry/Reverb → MasterGain
+//                                                              ↓ (only when recording)
+//                                                     MediaStreamDestination → recorder
+//
+// ctx.destination only receives: nothing from the mic chain.
+// Beat audio (HTMLAudioElement) plays independently via the OS audio path.
+// ────────────────────────────────────────────────────────────────────────────
 
 import type { VocalPreset } from "./presets";
 import { generateReverbIR } from "./reverbImpulse";
@@ -30,7 +44,11 @@ export class AudioEngine {
   private micSource: MediaStreamAudioSourceNode | null = null;
   private micStream: MediaStream | null = null;
   private inputGain: GainNode | null = null;
-  private analyser: AnalyserNode | null = null;
+
+  // rawAnalyser: taps off inputGain BEFORE the worklet — for waveform display only.
+  // It is intentionally NOT connected to ctx.destination.
+  private rawAnalyser: AnalyserNode | null = null;
+
   private compressor: DynamicsCompressorNode | null = null;
   private eqLow: BiquadFilterNode | null = null;
   private eqMid: BiquadFilterNode | null = null;
@@ -39,16 +57,14 @@ export class AudioEngine {
   private reverbGain: GainNode | null = null;
   private dryGain: GainNode | null = null;
   private masterGain: GainNode | null = null;
-  private beatSource: AudioBufferSourceNode | null = null;
-  private beatGain: GainNode | null = null;
-  private beatBuffer: AudioBuffer | null = null;
-  private beatAnalyser: AnalyserNode | null = null;
+
+  // Recording destination — created fresh on each startRecording() call
+  private recDest: MediaStreamAudioDestinationNode | null = null;
   private recorder: MediaRecorder | null = null;
   private recordedChunks: Blob[] = [];
 
   // State
   private _state: AudioEngineState = "idle";
-  private _beatPlaying = false;
 
   // Callbacks
   public onPitchUpdate: ((info: PitchInfo) => void) | null = null;
@@ -63,9 +79,12 @@ export class AudioEngine {
   }
 
   get state() { return this._state; }
-  get beatPlaying() { return this._beatPlaying; }
-  get analyserNode() { return this.analyser; }
-  get beatAnalyserNode() { return this.beatAnalyser; }
+
+  /**
+   * Expose the raw (pre-worklet) analyser for waveform / VU visualisation.
+   * This analyser is connected to inputGain only — NOT to ctx.destination.
+   */
+  get analyserNode() { return this.rawAnalyser; }
 
   private setState(s: AudioEngineState) {
     this._state = s;
@@ -106,11 +125,18 @@ export class AudioEngine {
 
     this.micSource = this.ctx.createMediaStreamSource(this.micStream);
 
-    // ── Build signal chain ──
-    // Mic → InputGain → Worklet → EQ Low → EQ Mid → EQ High → Compressor → [Dry + Reverb] → Master → Analyser → Dest
+    // ── Input Gain ──
     this.inputGain = this.ctx.createGain();
     this.inputGain.gain.value = 1.0;
 
+    // ── Raw Analyser (for waveform/VU display) ──
+    // Taps off inputGain BEFORE pitch processing. 
+    // It is a sink-only node — nothing after it reaches ctx.destination.
+    this.rawAnalyser = this.ctx.createAnalyser();
+    this.rawAnalyser.fftSize = 2048;
+    this.rawAnalyser.smoothingTimeConstant = 0.6;
+
+    // ── Worklet (pitch correction) ──
     this.workletNode = new AudioWorkletNode(this.ctx, "pitch-processor", {
       numberOfInputs: 1,
       numberOfOutputs: 1,
@@ -123,7 +149,7 @@ export class AudioEngine {
       }
     };
 
-    // EQ chain
+    // ── EQ chain ──
     this.eqLow = this.ctx.createBiquadFilter();
     this.eqLow.type = "lowshelf";
     this.eqLow.frequency.value = 120;
@@ -140,7 +166,7 @@ export class AudioEngine {
     this.eqHigh.frequency.value = 8000;
     this.eqHigh.gain.value = 0;
 
-    // Compressor
+    // ── Compressor ──
     this.compressor = this.ctx.createDynamicsCompressor();
     this.compressor.threshold.value = -24;
     this.compressor.ratio.value = 8;
@@ -148,25 +174,37 @@ export class AudioEngine {
     this.compressor.release.value = 0.1;
     this.compressor.knee.value = 4;
 
-    // Dry/Wet split
+    // ── Dry/Wet (reverb) split ──
     this.dryGain = this.ctx.createGain();
-    this.dryGain.gain.value = 0.7;
+    this.dryGain.gain.value = 0.85;
 
     this.reverb = this.ctx.createConvolver();
     this.reverb.buffer = generateReverbIR(this.ctx, 1.5, 0.3);
 
     this.reverbGain = this.ctx.createGain();
-    this.reverbGain.gain.value = 0.3;
+    this.reverbGain.gain.value = 0.15;
 
     this.masterGain = this.ctx.createGain();
     this.masterGain.gain.value = 1.0;
 
-    this.analyser = this.ctx.createAnalyser();
-    this.analyser.fftSize = 2048;
-    this.analyser.smoothingTimeConstant = 0.85;
-
-    // Connect the chain
+    // ── Connect the chain ──
+    //
+    // Mic → InputGain → [rawAnalyser (dead end — visualization only)]
+    //                 → Worklet → EqLow → EqMid → EqHigh → Compressor
+    //                                                         ↓
+    //                                               ┌── dryGain ──┐
+    //                                               └── reverb → reverbGain ──┘
+    //                                                         ↓
+    //                                                    masterGain
+    //                                                    (floating — NOT wired to ctx.destination)
+    //                                                    Connected to recDest only when recording.
+    //
     this.micSource.connect(this.inputGain);
+
+    // Tap for waveform display (sink — no further connection)
+    this.inputGain.connect(this.rawAnalyser);
+
+    // Main processing chain
     this.inputGain.connect(this.workletNode);
     this.workletNode.connect(this.eqLow);
     this.eqLow.connect(this.eqMid);
@@ -182,9 +220,8 @@ export class AudioEngine {
     this.reverb.connect(this.reverbGain);
     this.reverbGain.connect(this.masterGain);
 
-    // Master → Analyser → Output
-    this.masterGain.connect(this.analyser);
-    this.analyser.connect(this.ctx.destination);
+    // masterGain is intentionally NOT connected to ctx.destination here.
+    // It will be connected to recDest only when startRecording() is called.
   }
 
   stopMic(): void {
@@ -192,75 +229,36 @@ export class AudioEngine {
     this.micSource?.disconnect();
     this.micStream = null;
     this.micSource = null;
-  }
-
-  // ── Beat Playback ─────────────────────────────────────────────────────────
-  async loadBeat(file: File): Promise<void> {
-    if (!this.ctx) throw new Error("AudioEngine not initialized");
-
-    const arrayBuffer = await file.arrayBuffer();
-    this.beatBuffer = await this.ctx.decodeAudioData(arrayBuffer);
-
-    if (!this.beatGain) {
-      this.beatGain = this.ctx.createGain();
-      this.beatGain.gain.value = 0.8;
-
-      this.beatAnalyser = this.ctx.createAnalyser();
-      this.beatAnalyser.fftSize = 2048;
-      this.beatAnalyser.smoothingTimeConstant = 0.85;
-
-      this.beatGain.connect(this.beatAnalyser);
-      this.beatAnalyser.connect(this.ctx.destination);
-    }
-  }
-
-  playBeat(): void {
-    if (!this.ctx || !this.beatBuffer || !this.beatGain) return;
-    if (this.ctx.state === "suspended") this.ctx.resume();
-
-    this.beatSource?.stop();
-    this.beatSource = this.ctx.createBufferSource();
-    this.beatSource.buffer = this.beatBuffer;
-    this.beatSource.loop = true;
-    this.beatSource.connect(this.beatGain);
-    this.beatSource.start();
-    this._beatPlaying = true;
-  }
-
-  stopBeat(): void {
-    this.beatSource?.stop();
-    this.beatSource = null;
-    this._beatPlaying = false;
-  }
-
-  setBeatVolume(vol: number): void {
-    if (this.beatGain) {
-      this.beatGain.gain.linearRampToValueAtTime(
-        Math.max(0, Math.min(4, vol)),
-        (this.ctx?.currentTime ?? 0) + 0.05
-      );
-    }
+    // Also clean up worklet/EQ/compressor/etc so they don't linger
+    try { this.workletNode?.disconnect(); } catch (_) {}
+    try { this.eqLow?.disconnect(); } catch (_) {}
+    try { this.eqMid?.disconnect(); } catch (_) {}
+    try { this.eqHigh?.disconnect(); } catch (_) {}
+    try { this.compressor?.disconnect(); } catch (_) {}
+    try { this.dryGain?.disconnect(); } catch (_) {}
+    try { this.reverb?.disconnect(); } catch (_) {}
+    try { this.reverbGain?.disconnect(); } catch (_) {}
+    try { this.masterGain?.disconnect(); } catch (_) {}
+    try { this.rawAnalyser?.disconnect(); } catch (_) {}
+    try { this.inputGain?.disconnect(); } catch (_) {}
   }
 
   // ── Recording ─────────────────────────────────────────────────────────────
   startRecording(): void {
     if (!this.ctx || !this.masterGain) throw new Error("Mic not started");
 
-    // Capture the master output as a MediaStream
-    const dest = this.ctx.createMediaStreamDestination();
-    this.masterGain.connect(dest);
+    // Create a fresh MediaStreamDestination for this take
+    this.recDest = this.ctx.createMediaStreamDestination();
 
-    // Also capture beat if playing
-    if (this.beatGain) {
-      this.beatGain.connect(dest);
-    }
+    // Connect the processed vocal chain to the recording destination
+    this.masterGain.connect(this.recDest);
 
     this.recordedChunks = [];
-    this.recorder = new MediaRecorder(dest.stream, {
-      mimeType: MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-        ? "audio/webm;codecs=opus"
-        : "audio/webm",
-    });
+    const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+      ? "audio/webm;codecs=opus"
+      : "audio/webm";
+
+    this.recorder = new MediaRecorder(this.recDest.stream, { mimeType });
 
     this.recorder.ondataavailable = (e) => {
       if (e.data.size > 0) this.recordedChunks.push(e.data);
@@ -277,6 +275,11 @@ export class AudioEngine {
 
   stopRecording(): void {
     this.recorder?.stop();
+    // Disconnect masterGain from the recording destination so it's truly isolated
+    if (this.masterGain && this.recDest) {
+      try { this.masterGain.disconnect(this.recDest); } catch (_) {}
+    }
+    this.recDest = null;
     this.setState("ready");
   }
 
@@ -376,7 +379,6 @@ export class AudioEngine {
   // ── Cleanup ───────────────────────────────────────────────────────────────
   destroy(): void {
     this.stopMic();
-    this.stopBeat();
     this.ctx?.close();
     this.ctx = null;
     AudioEngine.instance = null;
